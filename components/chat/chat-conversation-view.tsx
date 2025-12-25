@@ -2,17 +2,7 @@ import { useEffect, useRef } from "react";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
 import { Loader2, SendHorizonal } from "lucide-react";
-import { ChatMessage } from "./chat-message";
-import { Hotel } from "@/components/hotel/hotel-card";
-
-interface Message {
-  id: string;
-  content: string;
-  sender: "user" | "ai";
-  timestamp: Date;
-  hotels?: Hotel[];
-  isStreaming?: boolean;
-}
+import { ChatMessage, Message } from "./chat-message";
 
 interface ChatConversationViewProps {
   messages: Message[];

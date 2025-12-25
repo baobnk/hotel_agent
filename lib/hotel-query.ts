@@ -21,7 +21,9 @@ export type HotelSearchResult = {
   price_per_night: number;
   tier: string | null;
   amenities: string[] | null;
-  similarity: number;
+  similarity: number; // Vector similarity score (0-1)
+  keywordScore?: number; // BM25-style keyword score (0-1)
+  combinedScore?: number; // Combined score (50% vector + 50% keyword)
 };
 
 export type HotelSearchResponse =
@@ -73,7 +75,7 @@ Examples:
 `;
 
   const response = await openai.chat.completions.create({
-    model: "gpt-4.1-mini",
+    model: "gpt-4o-mini",
     temperature: 0,
     messages: [
       { role: "system", content: systemPrompt },
@@ -167,179 +169,148 @@ export async function buildEmbeddingFromQuery(
   return embedding;
 }
 
-// LLM Validation Result type
-export type LLMValidationResult = {
-  validHotels: Array<{
-    hotel: HotelSearchResult;
-    matchScore: number; // 0-100
-    matchReason: string;
-  }>;
-  invalidHotels: Array<{
-    hotel: HotelSearchResult;
-    reason: string;
-  }>;
-  naturalResponse: string;
-};
-
 /**
- * Use LLM to validate search results against user query
- * - Filter out hotels that don't truly match the query
- * - Generate natural language response
+ * BM25-style keyword scoring algorithm
+ * 
+ * This calculates a relevance score based on keyword matches in:
+ * - Hotel name
+ * - Hotel description
+ * - Hotel amenities
+ * 
+ * The score is normalized to 0-1 range.
  */
-export async function validateAndFormatResultsWithLLM(
-  userQuery: string,
-  hints: HotelSearchHints,
-  hotels: HotelSearchResult[]
-): Promise<LLMValidationResult> {
-  if (!process.env.OPENAI_API_KEY) {
-    throw new Error("OPENAI_API_KEY is not set");
+export function calculateKeywordScore(
+  hotel: HotelSearchResult,
+  keywords: string[],
+  userQuery: string
+): number {
+  if (!keywords || keywords.length === 0) {
+    // If no keywords extracted, use simple query word matching
+    const queryWords = userQuery.toLowerCase().split(/\s+/).filter(w => w.length > 2);
+    if (queryWords.length === 0) return 0.5; // Neutral score
+    keywords = queryWords;
   }
 
-  // If no hotels, return early
-  if (hotels.length === 0) {
-    return {
-      validHotels: [],
-      invalidHotels: [],
-      naturalResponse: `Sorry, I couldn't find any hotels matching your request in ${hints.location || "this area"}. Would you like to try broadening your search criteria?`,
-    };
+  const hotelText = [
+    hotel.name,
+    hotel.description,
+    hotel.tier || "",
+    ...(hotel.amenities || [])
+  ].join(" ").toLowerCase();
+
+  // BM25 parameters
+  const k1 = 1.5; // Term frequency saturation parameter
+  const b = 0.75; // Length normalization parameter
+  const avgDocLength = 200; // Assumed average document length
+  const docLength = hotelText.length;
+
+  let score = 0;
+  let matchedKeywords = 0;
+
+  for (const keyword of keywords) {
+    // Count occurrences of keyword in hotel text
+    const regex = new RegExp(keyword, 'gi');
+    const matches = hotelText.match(regex);
+    const termFreq = matches ? matches.length : 0;
+
+    if (termFreq > 0) {
+      matchedKeywords++;
+      
+      // BM25 term frequency component
+      // TF = (tf * (k1 + 1)) / (tf + k1 * (1 - b + b * (docLength / avgDocLength)))
+      const tfScore = (termFreq * (k1 + 1)) / (termFreq + k1 * (1 - b + b * (docLength / avgDocLength)));
+      
+      // IDF component (simplified - assume each keyword is equally important)
+      const idfScore = 1;
+      
+      score += tfScore * idfScore;
+    }
   }
 
-  const systemPrompt = `You are a professional hotel concierge assistant. Your tasks:
+  // Normalize score to 0-1 range
+  // If all keywords matched perfectly, score should be close to 1
+  const maxPossibleScore = keywords.length * (k1 + 1);
+  const normalizedScore = Math.min(1, score / maxPossibleScore);
 
-1. EVALUATE each hotel based ONLY on the user's EXPLICIT requirements
-2. SCORE each hotel from 0-100 based on how well it matches
-3. RANK hotels by score (highest first) - DO NOT filter any out
-4. CREATE a natural, friendly response presenting the results
+  // Bonus for matching more unique keywords
+  const keywordCoverage = matchedKeywords / keywords.length;
+  
+  // Final score: weighted combination of BM25 score and keyword coverage
+  const finalScore = normalizedScore * 0.6 + keywordCoverage * 0.4;
 
-CRITICAL EVALUATION RULES:
-- Evaluate ONLY against what the user EXPLICITLY asked for
-- "family-friendly" does NOT mean the hotel must have "Kids Club" - just that families can stay there
-- "quiet" means peaceful/tranquil - check the description
-- "pool" means the hotel should have a pool
-- "near beach" means close to beach
-- DO NOT invent requirements the user didn't state
-- In matchReason: describe what the hotel HAS that matches, not what it's missing
-- Only mention missing features if they were EXPLICITLY requested (pool, beach, specific amenities)
-
-SCORING GUIDE:
-- 90-100: Matches ALL explicit requirements
-- 70-89: Matches most requirements, minor gaps
-- 50-69: Matches some requirements
-- 0-49: Matches few requirements
-
-LANGUAGE: Default English. Match user's language if different.
-
-Return JSON:
-{
-  "validHotels": [
-    {
-      "hotelId": number,
-      "matchScore": number (0-100),
-      "matchReason": "What this hotel offers that matches the request"
-    }
-  ],
-  "naturalResponse": "Present hotels naturally. Focus on what they offer, not what they lack."
-}`;
-
-  const hotelsInfo = hotels.map((h, i) => ({
-    index: i + 1,
-    id: h.id,
-    name: h.name,
-    description: h.description,
-    location: h.location,
-    price: h.price_per_night,
-    tier: h.tier,
-    amenities: h.amenities,
-    similarityScore: h.similarity,
-  }));
-
-  const userPrompt = `USER QUERY (detect language from this):
-"${userQuery}"
-
-EXTRACTED SEARCH PARAMETERS (ONLY evaluate based on these):
-- Location: ${hints.location || "Any location"}
-- Tier: ${hints.tier || "Any tier"}
-- Min Price: ${hints.minPrice ? `$${hints.minPrice}` : "No minimum"}
-- Max Price: ${hints.maxPrice ? `$${hints.maxPrice}` : "No maximum"}
-- Keywords: ${hints.keywords?.join(", ") || "None - do not assume any keywords"}
-- Required Amenities: ${hints.amenities?.join(", ") || "None - do not require any specific amenities"}
-
-IMPORTANT: If a parameter is "None" or "Any", do NOT use it to filter or penalize hotels.
-
-SEARCH RESULTS (${hotels.length} hotels):
-${JSON.stringify(hotelsInfo, null, 2)}
-
-Evaluate each hotel ONLY against the specified parameters. Present results naturally.`;
-
-  try {
-    const response = await openai.chat.completions.create({
-      model: "gpt-4.1-mini",
-      temperature: 0.3,
-      messages: [
-        { role: "system", content: systemPrompt },
-        { role: "user", content: userPrompt },
-      ],
-      response_format: { type: "json_object" },
-    });
-
-    const content = response.choices[0]?.message?.content;
-    if (!content) {
-      throw new Error("LLM validation response was empty");
-    }
-
-    const parsed = JSON.parse(content);
-
-    // Map ALL hotels back with their scores (no filtering)
-    const validHotels: LLMValidationResult["validHotels"] = [];
-    const scoredHotelIds = new Set<number>();
-
-    // Process hotels that LLM scored
-    if (Array.isArray(parsed.validHotels)) {
-      for (const v of parsed.validHotels) {
-        const hotel = hotels.find((h) => h.id === v.hotelId);
-        if (hotel) {
-          validHotels.push({
-            hotel,
-            matchScore: v.matchScore,
-            matchReason: v.matchReason || "",
-          });
-          scoredHotelIds.add(hotel.id);
-        }
-      }
-    }
-
-    // Add any hotels that LLM didn't score (with default score based on similarity)
-    for (const hotel of hotels) {
-      if (!scoredHotelIds.has(hotel.id)) {
-        validHotels.push({
-          hotel,
-          matchScore: Math.round(((hotel.similarity + 1) / 2) * 100),
-          matchReason: "Matched by semantic search",
-        });
-      }
-    }
-
-    // Sort ALL hotels by matchScore descending (higher scores first)
-    validHotels.sort((a, b) => b.matchScore - a.matchScore);
-
-    return {
-      validHotels,
-      invalidHotels: [], // No filtering, all hotels included
-      naturalResponse: parsed.naturalResponse || `Found ${validHotels.length} hotels sorted by relevance.`,
-    };
-  } catch (error) {
-    console.error("LLM validation error:", error);
-    // Fallback: return all hotels as valid with default response
-    return {
-      validHotels: hotels.map((hotel) => ({
-        hotel,
-        matchScore: Math.round(((hotel.similarity + 1) / 2) * 100),
-        matchReason: "Matched by semantic search",
-      })),
-      invalidHotels: [],
-      naturalResponse: `Found ${hotels.length} hotels in ${hints.location}. The top match is "${hotels[0]?.name}" at $${hotels[0]?.price_per_night}/night.`,
-    };
-  }
+  return Math.max(0, Math.min(1, finalScore));
 }
 
+/**
+ * Calculate combined score from vector similarity and keyword matching
+ * 
+ * @param vectorScore - Vector similarity score (cosine similarity, range -1 to 1)
+ * @param keywordScore - Keyword matching score (range 0 to 1)
+ * @param vectorWeight - Weight for vector score (default 0.5)
+ * @returns Combined score (range 0 to 1)
+ */
+export function calculateCombinedScore(
+  vectorScore: number,
+  keywordScore: number,
+  vectorWeight: number = 0.5
+): number {
+  // Normalize vector score from (-1, 1) to (0, 1)
+  const normalizedVectorScore = (vectorScore + 1) / 2;
+  
+  const keywordWeight = 1 - vectorWeight;
+  
+  return normalizedVectorScore * vectorWeight + keywordScore * keywordWeight;
+}
 
+/**
+ * Score and rank hotels using hybrid approach:
+ * 1. Vector similarity (semantic matching)
+ * 2. BM25 keyword matching
+ * 3. Combined 50/50 score
+ */
+export function scoreAndRankHotels(
+  hotels: HotelSearchResult[],
+  keywords: string[] | null,
+  userQuery: string
+): HotelSearchResult[] {
+  const scoredHotels = hotels.map(hotel => {
+    const keywordScore = calculateKeywordScore(hotel, keywords || [], userQuery);
+    const combinedScore = calculateCombinedScore(hotel.similarity, keywordScore, 0.5);
+    
+    return {
+      ...hotel,
+      keywordScore,
+      combinedScore,
+    };
+  });
+
+  // Sort by combined score (highest first)
+  scoredHotels.sort((a, b) => (b.combinedScore || 0) - (a.combinedScore || 0));
+
+  return scoredHotels;
+}
+
+/**
+ * Generate natural language response for search results
+ */
+export function generateNaturalResponse(
+  hotels: HotelSearchResult[],
+  hints: HotelSearchHints
+): string {
+  if (hotels.length === 0) {
+    return `Sorry, I couldn't find any hotels matching your request in ${hints.location || "this area"}. Would you like to try broadening your search criteria?`;
+  }
+
+  const topHotel = hotels[0];
+  const priceInfo = hints.maxPrice ? ` within your budget of $${hints.maxPrice}` : "";
+  const tierInfo = hints.tier ? ` in the ${hints.tier} category` : "";
+  
+  let response = `Found ${hotels.length} hotel${hotels.length > 1 ? 's' : ''} in ${hints.location}${priceInfo}${tierInfo}. `;
+  
+  if (topHotel) {
+    const score = Math.round((topHotel.combinedScore || topHotel.similarity) * 100);
+    response += `The top match is "${topHotel.name}" at $${topHotel.price_per_night}/night with ${score}% relevance.`;
+  }
+
+  return response;
+}
