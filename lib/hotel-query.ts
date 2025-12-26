@@ -292,24 +292,67 @@ export function scoreAndRankHotels(
 
 /**
  * Generate natural language response for search results
+ * Tone: Friendly, professional hotel booking consultant
  */
 export function generateNaturalResponse(
   hotels: HotelSearchResult[],
   hints: HotelSearchHints
 ): string {
   if (hotels.length === 0) {
-    return `Sorry, I couldn't find any hotels matching your request in ${hints.location || "this area"}. Would you like to try broadening your search criteria?`;
+    return `I apologize, but I couldn't find any hotels matching your preferences in ${hints.location || "that area"}. Would you like me to search with different criteria, such as a broader price range or different amenities?`;
   }
 
   const topHotel = hotels[0];
-  const priceInfo = hints.maxPrice ? ` within your budget of $${hints.maxPrice}` : "";
-  const tierInfo = hints.tier ? ` in the ${hints.tier} category` : "";
+  const hotelCount = hotels.length;
   
-  let response = `Found ${hotels.length} hotel${hotels.length > 1 ? 's' : ''} in ${hints.location}${priceInfo}${tierInfo}. `;
+  // Build friendly greeting
+  let response = `Great news! I've found ${hotelCount} excellent ${hotelCount === 1 ? 'option' : 'options'} for you in ${hints.location}. `;
   
+  // Highlight top recommendation
   if (topHotel) {
     const score = Math.round((topHotel.combinedScore || topHotel.similarity) * 100);
-    response += `The top match is "${topHotel.name}" at $${topHotel.price_per_night}/night with ${score}% relevance.`;
+    
+    // Build recommendation with natural language
+    response += `My top recommendation is **${topHotel.name}**, `;
+    
+    // Price highlight
+    if (topHotel.price_per_night) {
+      const priceComparison = hints.maxPrice && topHotel.price_per_night < hints.maxPrice * 0.7
+        ? ` which is well within your budget at just $${topHotel.price_per_night} per night`
+        : ` priced at $${topHotel.price_per_night} per night`;
+      response += priceComparison;
+    }
+    
+    // Tier highlight
+    if (topHotel.tier) {
+      response += ` (${topHotel.tier} tier)`;
+    }
+    
+    // Amenities highlight (if available)
+    if (topHotel.amenities && topHotel.amenities.length > 0) {
+      const keyAmenities = topHotel.amenities.slice(0, 3).join(", ");
+      response += `, featuring ${keyAmenities}`;
+      if (topHotel.amenities.length > 3) {
+        response += `, and more`;
+      }
+    }
+    
+    response += `. `;
+    
+    // Add match quality context
+    if (score >= 70) {
+      response += `This property matches your preferences very well. `;
+    } else if (score >= 50) {
+      response += `This is a good match for your needs. `;
+    }
+    
+    // Mention other options if available
+    if (hotelCount > 1) {
+      response += `I also have ${hotelCount - 1} other ${hotelCount === 2 ? 'option' : 'options'} below that you might like to consider. `;
+    }
+    
+    // Friendly closing
+    response += `Would you like more details about any of these properties, or shall I help you refine your search?`;
   }
 
   return response;

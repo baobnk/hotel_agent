@@ -1,29 +1,11 @@
 "use client";
 
-import { useState } from "react";
-import { Button } from "@/components/ui/button";
 import { Separator } from "@/components/ui/separator";
 import { Logo } from "@/components/ui/logo";
 import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuTrigger,
-} from "@/components/ui/dropdown-menu";
-import {
-  UsersIcon,
-  BriefcaseIcon,
-  GraduationCapIcon,
-  ChevronDownIcon,
   MapPinIcon,
   Building2Icon,
 } from "lucide-react";
-
-const teams = [
-  { id: "personal", name: "Personal", icon: UsersIcon },
-  { id: "work", name: "Work Team", icon: BriefcaseIcon },
-  { id: "education", name: "Education", icon: GraduationCapIcon },
-];
 
 const cities = [
   { name: "Melbourne", icon: MapPinIcon },
@@ -32,35 +14,12 @@ const cities = [
 ];
 
 export function ChatSidebar() {
-  const [selectedTeam, setSelectedTeam] = useState("personal");
-
   return (
     <div className="flex h-full w-full flex-col bg-sidebar border-r border-sidebar-border">
       {/* Header */}
-      <div className="flex items-center justify-between p-3 border-b border-sidebar-border">
-        <DropdownMenu>
-          <DropdownMenuTrigger asChild>
-            <Button
-              variant="ghost"
-              className="w-full justify-start gap-2.5 px-2 h-10"
-            >
-              <Logo className="size-6" />
-              <span className="font-semibold">Hotel Agent</span>
-              <ChevronDownIcon className="ml-auto size-4 opacity-60" />
-            </Button>
-          </DropdownMenuTrigger>
-          <DropdownMenuContent align="start" className="w-56">
-            {teams.map((team) => (
-              <DropdownMenuItem
-                key={team.id}
-                onClick={() => setSelectedTeam(team.id)}
-              >
-                <team.icon className="mr-2 size-4" />
-                {team.name}
-              </DropdownMenuItem>
-            ))}
-          </DropdownMenuContent>
-        </DropdownMenu>
+      <div className="flex items-center gap-2.5 p-3 border-b border-sidebar-border">
+        <Logo className="size-6" />
+        <span className="font-semibold">Hotel Agent</span>
       </div>
 
       <Separator />
