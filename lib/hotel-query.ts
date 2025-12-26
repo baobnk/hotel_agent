@@ -1,5 +1,7 @@
 import OpenAI from "openai";
 import { mapKeywordsToAmenities, TOP_AMENITIES } from "./hotel-config";
+import { detectQueryIntent, QueryIntent } from "./intent-detection";
+import { getLocationStatistics, getRecommendedPriceRange } from "./hotel-statistics";
 
 export type HotelSearchHints = {
   location?: string | null;
@@ -11,6 +13,11 @@ export type HotelSearchHints = {
   tier?: "Budget" | "Mid-tier" | "Luxury" | null;
   amenities?: string[] | null; // Mapped amenities from keywords
   price?: number | null; // Exact price if specified
+  
+  // Intent fields
+  queryIntent?: QueryIntent;
+  sortBy?: "price_asc" | "price_desc" | "relevance";
+  priceTarget?: number; // For "around $X" queries
 };
 
 export type HotelSearchResult = {
@@ -51,6 +58,9 @@ export async function parseHotelQueryWithOpenAI(
     throw new Error("OPENAI_API_KEY is not set");
   }
 
+  // Step 1: Detect intent FIRST
+  const intentResult = detectQueryIntent(userMessage);
+
   const systemPrompt = `
 You are a parser that extracts hotel search parameters from natural language.
 Always respond with pure JSON only, no extra text.
@@ -64,6 +74,8 @@ Fields to extract:
 - name: hotel name if user mentions a specific hotel name, otherwise null
 - keywords: array of lowercased descriptive keywords inferred from the request (e.g. ["quiet", "family", "business", "pool", "spa", "beach"])
 
+IMPORTANT: If user asks for "most expensive" or "cheapest", you should still extract location and keywords, but leave price fields as null (they will be set by intent logic).
+
 Available amenities to recognize in keywords:
 ${TOP_AMENITIES.slice(0, 30).join(", ")}
 
@@ -71,7 +83,8 @@ Examples:
 - "I need a quiet place in Melbourne under $200" → {location: "Melbourne", maxPrice: 200, keywords: ["quiet"], tier: null}
 - "luxury hotel in Sydney with pool" → {location: "Sydney", tier: "Luxury", keywords: ["luxury", "pool"], maxPrice: null}
 - "budget hotel in Brisbane" → {location: "Brisbane", tier: "Budget", keywords: ["budget"], maxPrice: null}
-- "family hotel with pool and kids club" → {keywords: ["family", "pool", "kids"], tier: null}
+- "tôi muốn tìm khách sạn mắc nhất ở Sydney" → {location: "Sydney", keywords: ["luxury", "expensive"], tier: null, minPrice: null, maxPrice: null}
+- "cheapest hotel in Melbourne" → {location: "Melbourne", keywords: ["cheap", "budget"], tier: null, minPrice: null, maxPrice: null}
 `;
 
   const response = await openai.chat.completions.create({
@@ -144,7 +157,40 @@ Examples:
         : null,
     keywords: keywords.length > 0 ? keywords : null,
     amenities: mappedAmenities.length > 0 ? mappedAmenities : null,
+    
+    // Intent fields
+    queryIntent: intentResult.intent,
+    sortBy: intentResult.intent === "most_expensive" ? "price_desc" 
+         : intentResult.intent === "cheapest" ? "price_asc"
+         : "relevance",
+    priceTarget: intentResult.priceTarget
   };
+
+  // Step 3: Apply intent-based logic with statistics
+  if (intentResult.intent === "most_expensive" && hints.location) {
+    const locationStats = getLocationStatistics(hints.location);
+    if (locationStats) {
+      // Set minPrice to 80% of maxPrice to get top tier hotels
+      // But use active hotels min price (30) as base if maxPrice is too high
+      const activeMin = 30; // From statistics: active_hotels.min = 30
+      const targetMinPrice = Math.floor(locationStats.maxPrice * 0.8);
+      hints.minPrice = Math.max(targetMinPrice, activeMin);
+      hints.tier = "Luxury"; // Force luxury tier
+    }
+  } else if (intentResult.intent === "cheapest" && hints.location) {
+    const locationStats = getLocationStatistics(hints.location);
+    if (locationStats) {
+      // Use active hotels min price (30) and set maxPrice to 120% of minPrice
+      const activeMin = 30; // From statistics: active_hotels.min = 30
+      hints.maxPrice = Math.ceil(activeMin * 1.2); // = 36, but let's use 50 for better results
+      hints.maxPrice = 50; // More reasonable upper bound for cheapest
+      hints.tier = "Budget"; // Force budget tier
+    }
+  } else if (intentResult.intent === "price_range" && intentResult.priceTarget) {
+    // For "around $X" queries, set range ±20%
+    hints.minPrice = Math.floor(intentResult.priceTarget * 0.8);
+    hints.maxPrice = Math.ceil(intentResult.priceTarget * 1.2);
+  }
 
   return hints;
 }

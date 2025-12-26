@@ -304,6 +304,18 @@ async function* streamHotelSearch(userMessage: string): AsyncGenerator<string> {
     similarity: row.similarity,
   }));
 
+  // Apply intent-based sorting BEFORE vector/BM25 scoring (if needed)
+  // For most_expensive and cheapest, we want price-based sorting
+  // For normal queries, we'll use relevance (vector + BM25) later
+  if (hints.sortBy === "price_desc") {
+    // Sort by price DESC for most expensive
+    hotels.sort((a, b) => b.price_per_night - a.price_per_night);
+  } else if (hints.sortBy === "price_asc") {
+    // Sort by price ASC for cheapest
+    hotels.sort((a, b) => a.price_per_night - b.price_per_night);
+  }
+  // else: keep original order (will be sorted by relevance later)
+
   // Step 3.2: SQL Filter Results
   yield JSON.stringify({
     step: "sql_results",
@@ -363,7 +375,19 @@ async function* streamHotelSearch(userMessage: string): AsyncGenerator<string> {
   const combinedResults = hotelsWithKeywordScore.map(hotel => ({
     ...hotel,
     combinedScore: calculateCombinedScore(hotel.similarity, hotel.keywordScore || 0, 0.5)
-  })).sort((a, b) => (b.combinedScore || 0) - (a.combinedScore || 0));
+  }));
+  
+  // Apply final sorting based on intent
+  if (hints.sortBy === "price_desc") {
+    // For most_expensive: sort by price DESC (ignore relevance score)
+    combinedResults.sort((a, b) => b.price_per_night - a.price_per_night);
+  } else if (hints.sortBy === "price_asc") {
+    // For cheapest: sort by price ASC (ignore relevance score)
+    combinedResults.sort((a, b) => a.price_per_night - b.price_per_night);
+  } else {
+    // For normal queries: sort by combinedScore (relevance)
+    combinedResults.sort((a, b) => (b.combinedScore || 0) - (a.combinedScore || 0));
+  }
 
   yield JSON.stringify({
     step: "combined_ranking",
