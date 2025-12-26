@@ -53,7 +53,7 @@ function StepCard({ step, index, isLast }: { step: ReasoningStep; index: number;
             className="flex items-center gap-2 w-full text-left group"
           >
             <h3 className="font-semibold text-foreground group-hover:text-primary transition-colors">
-              Step {index + 1}: {step.title}
+              {step.title}
             </h3>
             {step.details && (
               isExpanded ? (
