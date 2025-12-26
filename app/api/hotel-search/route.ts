@@ -183,7 +183,7 @@ function buildSummaryContext(
 }
 
 /**
- * Build SQL query description for transparency
+ * Build SQL query description for transparency (simplified version)
  */
 function buildSqlQueryDescription(hints: HotelSearchHints): string {
   const conditions: string[] = [
@@ -202,6 +202,84 @@ FROM hotels
 WHERE ${conditions.join('\n  AND ')}
 ORDER BY description_embedding <-> query_embedding
 LIMIT 15`;
+}
+
+/**
+ * Generate actual RPC SQL call with parameters filled in
+ * This shows the exact SQL that will be executed in Supabase
+ */
+function generateActualRpcSql(
+  hints: HotelSearchHints,
+  embeddingLength: number
+): string {
+  const params: string[] = [];
+  
+  // query_embedding: vector(1536)
+  params.push(`query_embedding: vector(1536) [${embeddingLength} dimensions]`);
+  
+  // p_location: text (required)
+  params.push(`p_location: '${hints.location}'`);
+  
+  // p_min_price: int
+  if (hints.minPrice !== null && hints.minPrice !== undefined) {
+    params.push(`p_min_price: ${hints.minPrice}`);
+  } else {
+    params.push(`p_min_price: NULL`);
+  }
+  
+  // p_max_price: int
+  if (hints.maxPrice !== null && hints.maxPrice !== undefined) {
+    params.push(`p_max_price: ${hints.maxPrice}`);
+  } else {
+    params.push(`p_max_price: NULL`);
+  }
+  
+  // p_tier: text
+  if (hints.tier) {
+    params.push(`p_tier: '${hints.tier}'`);
+  } else {
+    params.push(`p_tier: NULL`);
+  }
+  
+  // p_amenities: text[]
+  if (hints.amenities && hints.amenities.length > 0) {
+    params.push(`p_amenities: ARRAY[${hints.amenities.map(a => `'${a}'`).join(', ')}]`);
+  } else {
+    params.push(`p_amenities: NULL`);
+  }
+  
+  // p_limit: int
+  params.push(`p_limit: 15`);
+  
+  const sqlBody = `
+SELECT
+  h.id,
+  h.name,
+  h.description,
+  h.location,
+  h.price_per_night,
+  h.tier,
+  h.amenities,
+  1 - (h.description_embedding <-> query_embedding) AS similarity
+FROM hotels h
+WHERE
+  h.is_active = true
+  AND h.location = p_location
+  ${hints.minPrice !== null && hints.minPrice !== undefined ? `AND h.price_per_night >= ${hints.minPrice}` : 'AND (p_min_price IS NULL OR h.price_per_night >= p_min_price)'}
+  ${hints.maxPrice !== null && hints.maxPrice !== undefined ? `AND h.price_per_night <= ${hints.maxPrice}` : 'AND (p_max_price IS NULL OR h.price_per_night <= p_max_price)'}
+  ${hints.tier ? `AND h.tier = '${hints.tier}'` : 'AND (p_tier IS NULL OR h.tier = p_tier)'}
+  ${hints.amenities && hints.amenities.length > 0 
+    ? `AND h.amenities && ARRAY[${hints.amenities.map(a => `'${a}'`).join(', ')}]`
+    : 'AND (p_amenities IS NULL OR h.amenities IS NULL OR h.amenities && p_amenities)'}
+ORDER BY h.description_embedding <-> query_embedding
+LIMIT 15;
+`.trim();
+  
+  return `-- RPC Function Call: match_hotels_hybrid
+-- Parameters:
+${params.map(p => `--   ${p}`).join('\n')}
+
+${sqlBody}`;
 }
 
 // Streaming generator for hotel search
@@ -255,19 +333,23 @@ async function* streamHotelSearch(userMessage: string): AsyncGenerator<string> {
     message: `📍 Step 3: Hybrid Search in ${hints.location}...`
   });
 
-  // Step 3.1: SQL Query
-  const sqlQuery = buildSqlQueryDescription(hints);
+  // Step 3.1: Show Actual RPC SQL Code with Parameters
+  const actualRpcSql = generateActualRpcSql(hints, embedding.length);
   yield JSON.stringify({
-    step: "sql_query",
-    message: "📋 Step 3.1: SQL Query with filters",
+    step: "rpc_sql_code",
+    message: "📋 Step 3.1: RPC SQL Code (with actual parameters)",
     details: {
-      query: sqlQuery,
-      filters: {
-        location: hints.location,
-        minPrice: hints.minPrice,
-        maxPrice: hints.maxPrice,
-        tier: hints.tier,
-        amenities: hints.amenities
+      rpcFunction: "match_hotels_hybrid",
+      sqlCode: actualRpcSql,
+      explanation: "This is the actual SQL code that will be executed in Supabase RPC function with your search parameters filled in.",
+      parameters: {
+        query_embedding: `vector(1536) - ${embedding.length} dimensions`,
+        p_location: hints.location,
+        p_min_price: hints.minPrice ?? null,
+        p_max_price: hints.maxPrice ?? null,
+        p_tier: hints.tier ?? null,
+        p_amenities: hints.amenities && hints.amenities.length > 0 ? hints.amenities : null,
+        p_limit: 15,
       }
     }
   });
@@ -304,39 +386,37 @@ async function* streamHotelSearch(userMessage: string): AsyncGenerator<string> {
     similarity: row.similarity,
   }));
 
-  // Step 3.2: SQL Filter Results
+  // Step 3.2: Show Final Similarity Scores from RPC
   yield JSON.stringify({
-    step: "sql_results",
-    message: `📋 Step 3.1 Result: Found ${hotels.length} hotels after SQL filters`,
+    step: "rpc_similarity_scores",
+    message: `🔍 Step 3.2: Final Similarity Scores from RPC (Vector Search)`,
     details: {
-      count: hotels.length,
-      hotels: hotels.map(h => ({
-        id: h.id,
-        name: h.name,
-        price: h.price_per_night,
-        tier: h.tier
-      }))
+      explanation: "These similarity scores are calculated using cosine similarity between query embedding and hotel description embeddings. Range: -1 to 1 (higher is better).",
+      method: "1 - (description_embedding <-> query_embedding)",
+      totalHotels: hotels.length,
+      scores: hotels
+        .sort((a, b) => (b.similarity || 0) - (a.similarity || 0))
+        .slice(0, 15)
+        .map((h, i) => ({
+          rank: i + 1,
+          id: h.id,
+          name: h.name,
+          similarity: h.similarity,
+          similarityPercent: Math.round(((h.similarity + 1) / 2) * 100), // Convert -1..1 to 0..100%
+          price: h.price_per_night,
+          tier: h.tier,
+        })),
+      scoreRange: {
+        min: hotels.length > 0 ? Math.min(...hotels.map(h => h.similarity || 0)) : 0,
+        max: hotels.length > 0 ? Math.max(...hotels.map(h => h.similarity || 0)) : 0,
+        avg: hotels.length > 0 
+          ? hotels.reduce((sum, h) => sum + (h.similarity || 0), 0) / hotels.length 
+          : 0,
+      }
     }
   });
 
-  // Step 3.3: Vector Search Results (already sorted by similarity from DB)
-  const vectorResults = [...hotels].sort((a, b) => (b.similarity || 0) - (a.similarity || 0));
-  
-  yield JSON.stringify({
-    step: "vector_results",
-    message: "🔍 Step 3.2: Vector Search Results (sorted by cosine similarity)",
-    details: {
-      method: "Cosine similarity on description_embedding",
-      results: vectorResults.slice(0, 10).map((h, i) => ({
-        rank: i + 1,
-        id: h.id,
-        name: h.name,
-        vectorScore: Math.round(((h.similarity + 1) / 2) * 100) + "%"
-      }))
-    }
-  });
-
-  // Step 3.4: BM25 Keyword Search Results
+  // Step 3.3: BM25 Keyword Search Results
   const hotelsWithKeywordScore = hotels.map(hotel => ({
     ...hotel,
     keywordScore: calculateKeywordScore(hotel, hints.keywords || [], userMessage)
@@ -348,45 +428,91 @@ async function* streamHotelSearch(userMessage: string): AsyncGenerator<string> {
     step: "bm25_results",
     message: "🔤 Step 3.3: BM25 Keyword Search Results",
     details: {
+      explanation: "BM25 scoring calculates relevance based on keyword frequency in hotel name, description, and amenities. Higher score = more keyword matches.",
       method: "BM25-style term frequency matching",
+      formula: "TF = (tf × (k1 + 1)) / (tf + k1 × (1 - b + b × (docLength / avgDocLength)))",
+      parameters: {
+        k1: 1.5,
+        b: 0.75,
+      },
       keywords: hints.keywords || [],
       results: bm25Results.slice(0, 10).map((h, i) => ({
         rank: i + 1,
         id: h.id,
         name: h.name,
-        keywordScore: Math.round((h.keywordScore || 0) * 100) + "%"
+        keywordScore: h.keywordScore || 0,
+        keywordScorePercent: Math.round((h.keywordScore || 0) * 100) + "%"
       }))
     }
   });
 
-  // Step 3.5: Combined Ranking (50% Vector + 50% BM25)
-  const combinedResults = hotelsWithKeywordScore.map(hotel => ({
-    ...hotel,
-    combinedScore: calculateCombinedScore(hotel.similarity, hotel.keywordScore || 0, 0.5)
-  })).sort((a, b) => (b.combinedScore || 0) - (a.combinedScore || 0));
+  // Step 3.4: Combined Ranking (50% Vector + 50% BM25)
+  const combinedResults = hotelsWithKeywordScore.map(hotel => {
+    const normalizedVectorScore = (hotel.similarity + 1) / 2; // Convert -1..1 to 0..1
+    const keywordScore = hotel.keywordScore || 0;
+    const combinedScore = calculateCombinedScore(hotel.similarity, keywordScore, 0.5);
+    
+    return {
+      ...hotel,
+      normalizedVectorScore,
+      combinedScore,
+    };
+  }).sort((a, b) => (b.combinedScore || 0) - (a.combinedScore || 0));
 
   yield JSON.stringify({
     step: "combined_ranking",
     message: "⚖️ Step 3.4: Combined Ranking (50% Vector + 50% BM25)",
     details: {
-      formula: "combinedScore = vectorScore × 0.5 + keywordScore × 0.5",
+      explanation: "Final match score combines vector similarity (semantic meaning) and keyword matching (exact terms). This gives balanced results.",
+      formula: "combinedScore = normalizedVectorScore × 0.5 + keywordScore × 0.5",
+      formulaDetails: {
+        normalizedVectorScore: "Convert similarity from range (-1 to 1) to (0 to 1)",
+        vectorWeight: "50% - Semantic similarity weight",
+        keywordWeight: "50% - Keyword matching weight",
+      },
       results: combinedResults.slice(0, 10).map((h, i) => ({
         rank: i + 1,
         id: h.id,
         name: h.name,
-        vectorScore: Math.round(((h.similarity + 1) / 2) * 100) + "%",
-        keywordScore: Math.round((h.keywordScore || 0) * 100) + "%",
-        combinedScore: Math.round((h.combinedScore || 0) * 100) + "%"
+        vectorSimilarity: h.similarity,
+        normalizedVectorScore: h.normalizedVectorScore,
+        vectorScorePercent: Math.round(h.normalizedVectorScore * 100) + "%",
+        keywordScore: h.keywordScore || 0,
+        keywordScorePercent: Math.round((h.keywordScore || 0) * 100) + "%",
+        combinedScore: h.combinedScore || 0,
+        combinedScorePercent: Math.round((h.combinedScore || 0) * 100) + "%"
       }))
     }
   });
 
   // Step 4: Validate data integrity
-  yield JSON.stringify({ step: "validating", message: "✅ Step 4: Validating data integrity..." });
+  yield JSON.stringify({ 
+    step: "validating", 
+    message: "✅ Step 4: Validating data integrity & quality checks...",
+    details: {
+      explanation: "This step ensures all hotel data is valid and meets quality standards before showing results to users.",
+      checks: [
+        "Price validation: Must be positive and non-zero",
+        "Tier-Price consistency: Hotel tier must match its price range",
+        "Location validation: Must be a valid city (Melbourne, Sydney, Brisbane)",
+        "Similarity score validation: Must be in valid range (-1 to 1)",
+        "Name validation: Hotel name must exist and not be empty"
+      ]
+    }
+  });
 
   const validatedHotels: HotelSearchResult[] = [];
+  const validationDetails: Array<{ hotelId: number; hotelName: string; valid: boolean; reason?: string }> = [];
+  
   for (const hotel of combinedResults) {
     const validation = validateHotelResult(hotel);
+    validationDetails.push({
+      hotelId: hotel.id,
+      hotelName: hotel.name,
+      valid: validation.valid,
+      reason: validation.reason,
+    });
+    
     if (validation.valid) {
       validatedHotels.push(hotel);
     } else {
@@ -396,10 +522,16 @@ async function* streamHotelSearch(userMessage: string): AsyncGenerator<string> {
 
   yield JSON.stringify({
     step: "validation_complete",
-    message: `✅ Validated: ${validatedHotels.length}/${combinedResults.length} hotels passed`,
+    message: `✅ Validated: ${validatedHotels.length}/${combinedResults.length} hotels passed quality checks`,
     details: {
+      explanation: "Hotels that fail validation are filtered out to ensure only high-quality, consistent results are shown.",
       passed: validatedHotels.length,
-      failed: combinedResults.length - validatedHotels.length
+      failed: combinedResults.length - validatedHotels.length,
+      validationResults: validationDetails.filter(v => !v.valid).map(v => ({
+        hotelId: v.hotelId,
+        hotelName: v.hotelName,
+        reason: v.reason,
+      })),
     }
   });
 

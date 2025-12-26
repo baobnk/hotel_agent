@@ -1,7 +1,7 @@
 import { useEffect, useRef } from "react";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
-import { Loader2, SendHorizonal } from "lucide-react";
+import { Loader2, SendHorizonal, RotateCcw } from "lucide-react";
 import { ChatMessage, Message } from "./chat-message";
 
 interface ChatConversationViewProps {
@@ -35,6 +35,17 @@ export function ChatConversationView({
           {/* Header */}
           <div className="flex items-center justify-between mb-4 pb-4 border-b border-border">
             <h2 className="text-lg font-semibold">Hotel Search</h2>
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={onReset}
+              disabled={isLoading}
+              className="h-8 px-3 gap-2 text-muted-foreground hover:text-foreground"
+              title="Reset conversation"
+            >
+              <RotateCcw className="size-4" />
+              <span className="hidden sm:inline">Reset</span>
+            </Button>
           </div>
 
           {/* Messages */}

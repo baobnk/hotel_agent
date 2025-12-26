@@ -44,7 +44,8 @@ export function ChatMain() {
     hotelsCount: number,
     validatedCount: number,
     finalCount: number,
-    summaryContext?: any
+    rpcSqlCode?: string,
+    similarityScores?: Array<{ id: number; name: string; similarity: number; similarityPercent: number; price: number; tier: string | null }>
   ): ReasoningFlowData => {
     const steps: ReasoningStep[] = [
       {
@@ -66,39 +67,29 @@ export function ChatMain() {
         }
       },
       {
-        id: "embedding",
-        title: "Step 2: Create Embedding",
-        icon: "🧠",
-        description: "Converted query into a 1536-dimensional vector for semantic matching",
-        details: {
-          input: query,
-          output: "1536-dimensional vector",
-          reasoning: "Used text-embedding-3-small model to create semantic representation.",
-          data: {
-            model: "text-embedding-3-small",
-            dimensions: 1536
-          }
-        }
-      },
-      {
         id: "hybrid_search",
-        title: "Step 3: Hybrid Search (SQL + Vector + BM25)",
+        title: "Step 2: Hybrid Search (SQL + Vector + BM25)",
         icon: "📍",
         description: "Combined SQL filters, vector similarity, and keyword matching",
         details: {
           reasoning: "Multi-stage search combining hard filters with semantic and keyword relevance",
           data: {
-            "3.1 SQL Filters": `location='${hints?.location}', price, tier, amenities`,
-            "3.2 Vector Search": "Cosine similarity ranking",
-            "3.3 BM25 Keyword": "Term frequency matching",
-            "3.4 Combined Score": "50% Vector + 50% BM25",
-            "Hotels found": hotelsCount
+            "Vector Search": "Cosine similarity ranking",
+            "BM25 Keyword": "Term frequency matching",
+            "Combined Score": "50% Vector + 50% BM25",
+            "Hotels found": hotelsCount,
+            ...(rpcSqlCode && { "SQL RPC Code": rpcSqlCode }),
+            ...(similarityScores && similarityScores.length > 0 && {
+              "Top 5 Results (by Similarity Score)": similarityScores.slice(0, 5).map((h, i) => 
+                `${i + 1}. ${h.name} (${h.similarityPercent}% similarity, $${h.price}/night${h.tier ? `, ${h.tier}` : ""})`
+              ).join("; ")
+            })
           }
         }
       },
       {
         id: "validate",
-        title: "Step 4: Validate Results",
+        title: "Step 3: Validate Results",
         icon: "✅",
         description: "Checked data integrity and filtered invalid hotels",
         details: {
@@ -110,24 +101,8 @@ export function ChatMain() {
         }
       },
       {
-        id: "summary_context",
-        title: "Step 5: Summary Context & Filter Irrelevant",
-        icon: "📝",
-        description: "Summarized context and filtered out contradicting results based on query intent",
-        details: {
-          reasoning: "Analyzed query intent to remove hotels that contradict the user's needs",
-          data: {
-            "Query Intent": summaryContext?.queryIntent || "general_search",
-            "Relevant Filters": summaryContext?.relevantFilters?.join(", ") || "All filters applied",
-            "Hotels after intent filter": summaryContext?.relevantHotels?.length || finalCount,
-            "Filtered out (contradicting)": summaryContext?.filteredOutHotels?.length || 0,
-            "Context Summary": summaryContext?.contextSummary || "No contradicting results found"
-          }
-        }
-      },
-      {
         id: "response",
-        title: "Step 6: Return Top Results",
+        title: "Step 4: Return Top Results",
         icon: "✨",
         description: "Returned top 3-5 hotels sorted by combined score",
         details: {
@@ -158,6 +133,8 @@ export function ChatMain() {
     let hotelsFoundCount = 0;
     let validatedCount = 0;
     let summaryContext: any = null;
+    let rpcSqlCode: string | undefined = undefined;
+    let similarityScores: Array<{ id: number; name: string; similarity: number; similarityPercent: number; price: number; tier: string | null }> = [];
     
     try {
       const response = await fetch("/api/hotel-search", {
@@ -197,6 +174,23 @@ export function ChatMain() {
               // Progress message
               streamContent = parsed.message;
               updateMessage(messageId, { content: streamContent, isStreaming: true });
+              
+              // Collect RPC SQL code
+              if (parsed.step === "rpc_sql_code" && parsed.details?.sqlCode) {
+                rpcSqlCode = parsed.details.sqlCode;
+              }
+              
+              // Collect similarity scores
+              if (parsed.step === "rpc_similarity_scores" && parsed.details?.scores) {
+                similarityScores = parsed.details.scores.map((s: any) => ({
+                  id: s.id,
+                  name: s.name,
+                  similarity: s.similarity,
+                  similarityPercent: s.similarityPercent,
+                  price: s.price,
+                  tier: s.tier
+                }));
+              }
               
               // Collect summary context data
               if (parsed.step === "summary_context_complete" && parsed.details) {
@@ -248,7 +242,8 @@ export function ChatMain() {
                 hotelsFoundCount,
                 validatedCount,
                 hotelsWithScores.length,
-                summaryContext
+                rpcSqlCode,
+                similarityScores
               );
               
               setPendingBaseQuery(null);
@@ -298,6 +293,7 @@ export function ChatMain() {
     setMessage("");
     setPendingBaseQuery(null);
     setIsLoading(false);
+    streamingMessageId.current = null;
   };
 
   const handleSendMessage = (content: string) => {

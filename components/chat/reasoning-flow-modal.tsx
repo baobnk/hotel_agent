@@ -95,15 +95,46 @@ function StepCard({ step, index, isLast }: { step: ReasoningStep; index: number;
               {step.details.data && Object.keys(step.details.data).length > 0 && (
                 <div>
                   <span className="text-xs font-medium text-muted-foreground uppercase tracking-wide">Data</span>
-                  <div className="mt-2 grid grid-cols-2 gap-2">
-                    {Object.entries(step.details.data).map(([key, value]) => (
-                      <div key={key} className="text-sm">
-                        <span className="text-muted-foreground">{key}: </span>
-                        <span className="font-medium">
-                          {Array.isArray(value) ? value.join(", ") || "None" : String(value)}
-                        </span>
-                      </div>
-                    ))}
+                  <div className="mt-2 space-y-3">
+                    {Object.entries(step.details.data).map(([key, value]) => {
+                      // Special handling for SQL RPC Code
+                      if (key === "SQL RPC Code" && typeof value === "string") {
+                        return (
+                          <div key={key} className="space-y-1">
+                            <span className="text-xs font-medium text-muted-foreground">{key}:</span>
+                            <pre className="text-xs bg-background border border-border rounded p-2 overflow-x-auto font-mono">
+                              {value}
+                            </pre>
+                          </div>
+                        );
+                      }
+                      
+                      // Special handling for Top Results
+                      if (key === "Top 5 Results (by Similarity Score)" && typeof value === "string") {
+                        return (
+                          <div key={key} className="space-y-1">
+                            <span className="text-xs font-medium text-muted-foreground">{key}:</span>
+                            <div className="text-sm space-y-1.5 mt-2">
+                              {value.split("; ").map((item, idx) => (
+                                <div key={idx} className="pl-3 py-1.5 border-l-2 border-primary/30 bg-muted/30 rounded-r">
+                                  <span className="font-medium text-primary/80">{item}</span>
+                                </div>
+                              ))}
+                            </div>
+                          </div>
+                        );
+                      }
+                      
+                      // Default rendering
+                      return (
+                        <div key={key} className="text-sm">
+                          <span className="text-muted-foreground">{key}: </span>
+                          <span className="font-medium">
+                            {Array.isArray(value) ? value.join(", ") || "None" : String(value)}
+                          </span>
+                        </div>
+                      );
+                    })}
                   </div>
                 </div>
               )}
