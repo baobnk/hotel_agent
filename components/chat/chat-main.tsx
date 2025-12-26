@@ -6,6 +6,7 @@ import { ChatConversationView } from "./chat-conversation-view";
 import { Hotel } from "@/components/hotel/hotel-card";
 import { Message } from "./chat-message";
 import { ReasoningFlowData, ReasoningStep } from "./reasoning-flow-modal";
+import { PROJECT_CONFIG } from "@/lib/project-config";
 
 export function ChatMain() {
   const [message, setMessage] = useState("");
@@ -49,14 +50,26 @@ export function ChatMain() {
   ): ReasoningFlowData => {
     const steps: ReasoningStep[] = [
       {
+        id: "context",
+        title: "Step 0: Context Summary",
+        icon: "📝",
+        description: "Analyzed conversation history for relevant context",
+        details: {
+          reasoning: "Summarize previous messages to maintain conversation continuity",
+          data: {
+            "Query": query,
+          }
+        }
+      },
+      {
         id: "extract",
-        title: "Step 1: Extract Information from Query",
+        title: "Step 1: Extract Search Parameters",
         icon: "🔍",
-        description: "Analyzed your natural language query to identify search criteria",
+        description: "Extracted structured search criteria from natural language",
         details: {
           input: query,
           output: `Location: ${hints?.location || "Not specified"}, Price: ${hints?.maxPrice ? `≤ $${hints.maxPrice}` : hints?.minPrice ? `≥ $${hints.minPrice}` : "Any"}, Tier: ${hints?.tier || "Any"}`,
-          reasoning: "Used GPT-4o-mini to parse natural language and extract structured search parameters",
+          reasoning: "Used GPT-4.1-mini to parse natural language and extract structured search parameters",
           data: {
             location: hints?.location || "Not specified",
             priceRange: hints?.maxPrice ? `≤ $${hints.maxPrice}` : "Any",
@@ -67,21 +80,34 @@ export function ChatMain() {
         }
       },
       {
+        id: "embedding",
+        title: "Step 2: Generate Semantic Embedding",
+        icon: "🧠",
+        description: "Created 1536-dimension vector for semantic search",
+        details: {
+          reasoning: "Used text-embedding-3-small to convert query to vector representation",
+          data: {
+            "Model": "text-embedding-3-small",
+            "Dimensions": "1536",
+          }
+        }
+      },
+      {
         id: "hybrid_search",
-        title: "Step 2: Hybrid Search (SQL + Vector + BM25)",
+        title: "Step 3: Hybrid Search",
         icon: "📍",
         description: "Combined SQL filters, vector similarity, and keyword matching",
         details: {
-          reasoning: "Multi-stage search combining hard filters with semantic and keyword relevance",
+          reasoning: "Multi-stage search: SQL filters → Vector similarity → BM25 keyword matching → Combined ranking",
           data: {
-            "Vector Search": "Cosine similarity ranking",
-            "BM25 Keyword": "Term frequency matching",
-            "Combined Score": "50% Vector + 50% BM25",
+            "SQL Filters": "Location, Price, Tier",
+            "Vector Search": "Cosine similarity (50%)",
+            "BM25 Keyword": "Term frequency matching (50%)",
             "Hotels found": hotelsCount,
             ...(rpcSqlCode && { "SQL RPC Code": rpcSqlCode }),
             ...(similarityScores && similarityScores.length > 0 && {
-              "Top 5 Results (by Similarity Score)": similarityScores.slice(0, 5).map((h, i) => 
-                `${i + 1}. ${h.name} (${h.similarityPercent}% similarity, $${h.price}/night${h.tier ? `, ${h.tier}` : ""})`
+              "Top 5 Results (by Match Score)": similarityScores.slice(0, 5).map((h, i) => 
+                `${i + 1}. ${h.name} (${h.similarityPercent}% match, $${h.price}/night${h.tier ? `, ${h.tier}` : ""})`
               ).join("; ")
             })
           }
@@ -89,11 +115,11 @@ export function ChatMain() {
       },
       {
         id: "validate",
-        title: "Step 3: Validate Results",
+        title: "Step 4: Validate Results",
         icon: "✅",
-        description: "Checked data integrity and filtered invalid hotels",
+        description: "Checked data integrity and quality criteria",
         details: {
-          reasoning: "Ensured all hotels have valid data before returning",
+          reasoning: "Ensured all hotels have valid data (price, location, tier consistency)",
           data: {
             "Total checked": hotelsCount,
             "Passed validation": validatedCount
@@ -101,12 +127,37 @@ export function ChatMain() {
         }
       },
       {
-        id: "response",
-        title: "Step 4: Return Top Results",
-        icon: "✨",
-        description: "Returned top 3-5 hotels sorted by combined score",
+        id: "ranking",
+        title: "Step 5: Final Ranking",
+        icon: "📊",
+        description: "Sorted by highest match score (score ties broken by price)",
         details: {
-          reasoning: "Final ranking by combinedScore = vectorScore × 0.5 + keywordScore × 0.5",
+          reasoning: "Hotels ranked by combinedScore = vectorScore × 0.5 + keywordScore × 0.5",
+          data: {
+            "Ranking method": "Highest match score first",
+            "Tie-breaker": "Lower price preferred"
+          }
+        }
+      },
+      {
+        id: "response",
+        title: "Step 6: Generate Response",
+        icon: "💬",
+        description: "Created personalized hotel recommendations",
+        details: {
+          reasoning: "Used GPT-4.1-mini to generate natural language recommendations",
+          data: {
+            "Response style": "Hotel booking consultant"
+          }
+        }
+      },
+      {
+        id: "results",
+        title: "Step 7: Return Results",
+        icon: "✨",
+        description: `Returned top ${finalCount} hotels sorted by match score`,
+        details: {
+          reasoning: "Final results with match scores and reasons",
           data: {
             "Results shown": finalCount
           }
@@ -137,10 +188,23 @@ export function ChatMain() {
     let similarityScores: Array<{ id: number; name: string; similarity: number; similarityPercent: number; price: number; tier: string | null }> = [];
     
     try {
+      // Build conversation context from previous messages
+      const conversationContext = messages
+        .filter(msg => msg.sender === "user" || msg.sender === "ai")
+        .slice(-PROJECT_CONFIG.conversation.maxContextMessages) // Last N messages to avoid too long context
+        .map(msg => ({
+          role: msg.sender === "user" ? "user" as const : "ai" as const,
+          content: msg.content,
+        }));
+
       const response = await fetch("/api/hotel-search", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ message: userContent, stream: true }),
+        body: JSON.stringify({ 
+          message: userContent, 
+          stream: true,
+          conversationContext,
+        }),
       });
 
       if (!response.ok) {
@@ -152,7 +216,9 @@ export function ChatMain() {
 
       const decoder = new TextDecoder();
       let streamContent = "";
+      let streamingResponse = ""; // For streaming natural language response
       let collectedHotels: Hotel[] = [];
+      let stepMessages: string[] = []; // Accumulate all step messages
 
       while (true) {
         const { done, value } = await reader.read();
@@ -171,8 +237,20 @@ export function ChatMain() {
             const parsed = JSON.parse(data);
 
             if (parsed.step) {
-              // Progress message
-              streamContent = parsed.message;
+              // Accumulate step messages (don't overwrite, append)
+              if (parsed.message && !stepMessages.includes(parsed.message)) {
+                stepMessages.push(parsed.message);
+              }
+              
+              // Display all accumulated step messages with visual indicators
+              // Format: ✓ Step 1: ... \n ✓ Step 2: ... \n ⏳ Step 3: ... (current)
+              const formattedSteps = stepMessages.map((msg, idx) => {
+                const isLast = idx === stepMessages.length - 1;
+                // Keep emoji for current step, remove for completed steps
+                const cleanMsg = msg.replace(/^[^\s]+\s/, '');
+                return isLast ? `⏳ ${msg}` : `✓ ${cleanMsg}`;
+              });
+              streamContent = formattedSteps.join("\n");
               updateMessage(messageId, { content: streamContent, isStreaming: true });
               
               // Collect RPC SQL code
@@ -196,6 +274,21 @@ export function ChatMain() {
               if (parsed.step === "summary_context_complete" && parsed.details) {
                 summaryContext = parsed.details;
               }
+            } else if (parsed.type === "response_chunk") {
+              // Streaming natural language response - word by word
+              // Clear step messages and show streaming response
+              streamingResponse += parsed.chunk;
+              updateMessage(messageId, { 
+                content: streamingResponse,
+                isStreaming: true
+              });
+            } else if (parsed.type === "response_complete") {
+              // Response streaming complete
+              streamingResponse = parsed.message;
+              updateMessage(messageId, { 
+                content: streamingResponse,
+                isStreaming: true
+              });
             } else if (parsed.type === "hotel") {
               // Individual hotel - merge matchScore into hotel object
               const hotelWithScore = {
@@ -205,8 +298,9 @@ export function ChatMain() {
               };
               collectedHotels.push(hotelWithScore);
               hotelsFoundCount = collectedHotels.length;
+              // Keep the natural response, just add hotels
               updateMessage(messageId, { 
-                content: `Found ${collectedHotels.length} hotels...`,
+                content: streamingResponse || `Found ${collectedHotels.length} hotels...`,
                 hotels: [...collectedHotels],
                 isStreaming: true
               });

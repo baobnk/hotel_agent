@@ -1,4 +1,5 @@
 import { NextRequest } from "next/server";
+import OpenAI from "openai";
 import { supabaseRpcWithRetry } from "@/lib/supabase";
 import {
   HotelSearchHints,
@@ -8,12 +9,21 @@ import {
   calculateKeywordScore,
   calculateCombinedScore,
   generateNaturalResponse,
+  generateNaturalResponseStreaming,
+  llmReRankHotels,
 } from "@/lib/hotel-query";
 import { validateHotelResult } from "@/lib/hotel-config";
+import { PROJECT_CONFIG, OPENAI_MODEL } from "@/lib/project-config";
+
+type ConversationMessage = {
+  role: "user" | "ai";
+  content: string;
+};
 
 type RequestBody = {
   message: string;
   stream?: boolean;
+  conversationContext?: ConversationMessage[]; // Conversation history
 };
 
 // Helper to create streaming response
@@ -39,147 +49,178 @@ function createStreamResponse(generator: AsyncGenerator<string>) {
 }
 
 /**
- * Summary Context - Filter irrelevant info based on query
+ * Summary Context - Summarize conversation context (NO FILTERING)
  */
 interface SummaryContext {
-  queryIntent: string;
-  relevantFilters: string[];
-  irrelevantFiltersRemoved: string[];
-  relevantHotels: HotelSearchResult[];
-  filteredOutHotels: { id: number; name: string; reason: string }[];
-  contextSummary: string;
+  conversationSummary: string;
+  extractedInfo: {
+    location?: string;
+    priceRange?: string;
+    tier?: string;
+    keywords?: string[];
+    amenities?: string[];
+  };
+  needsSummarization: boolean;
 }
 
-function buildSummaryContext(
-  query: string,
-  hints: HotelSearchHints,
-  hotels: HotelSearchResult[]
-): SummaryContext {
-  const queryLower = query.toLowerCase();
-  
-  // Determine query intent based on keywords
-  const intents: string[] = [];
-  if (queryLower.includes("quiet") || queryLower.includes("peaceful") || queryLower.includes("silent")) {
-    intents.push("quiet_peaceful");
+/**
+ * Summarize conversation context using LLM (if needed)
+ * Only summarizes if conversation is getting long (>3 messages or >500 chars)
+ */
+async function summarizeConversationContext(
+  conversationContext: ConversationMessage[],
+  currentMessage: string
+): Promise<SummaryContext> {
+  if (!conversationContext || conversationContext.length === 0) {
+    return {
+      conversationSummary: "No previous conversation context.",
+      extractedInfo: {},
+      needsSummarization: false,
+    };
   }
-  if (queryLower.includes("party") || queryLower.includes("nightlife") || queryLower.includes("club")) {
-    intents.push("party_nightlife");
-  }
-  if (queryLower.includes("family") || queryLower.includes("kid") || queryLower.includes("children")) {
-    intents.push("family_friendly");
-  }
-  if (queryLower.includes("business") || queryLower.includes("work") || queryLower.includes("meeting")) {
-    intents.push("business");
-  }
-  if (queryLower.includes("luxury") || queryLower.includes("premium") || queryLower.includes("expensive")) {
-    intents.push("luxury");
-  }
-  if (queryLower.includes("cheap") || queryLower.includes("budget") || queryLower.includes("affordable")) {
-    intents.push("budget");
-  }
-  if (queryLower.includes("beach") || queryLower.includes("surf") || queryLower.includes("ocean")) {
-    intents.push("beach");
-  }
-  if (queryLower.includes("romantic") || queryLower.includes("honeymoon") || queryLower.includes("couple")) {
-    intents.push("romantic");
-  }
-  
-  const queryIntent = intents.length > 0 ? intents.join(" + ") : "general_search";
-  
-  // Determine which filters are relevant
-  const relevantFilters: string[] = [];
-  const irrelevantFiltersRemoved: string[] = [];
-  
-  if (hints.location) relevantFilters.push(`Location: ${hints.location}`);
-  if (hints.maxPrice) relevantFilters.push(`Max price: $${hints.maxPrice}`);
-  if (hints.minPrice) relevantFilters.push(`Min price: $${hints.minPrice}`);
-  if (hints.tier) relevantFilters.push(`Tier: ${hints.tier}`);
-  if (hints.keywords?.length) relevantFilters.push(`Keywords: ${hints.keywords.join(", ")}`);
-  if (hints.amenities?.length) relevantFilters.push(`Amenities: ${hints.amenities.join(", ")}`);
-  
-  // Filter hotels based on query intent (remove contradicting hotels)
-  const relevantHotels: HotelSearchResult[] = [];
-  const filteredOutHotels: { id: number; name: string; reason: string }[] = [];
-  
-  for (const hotel of hotels) {
-    const hotelDesc = hotel.description.toLowerCase();
-    const hotelName = hotel.name.toLowerCase();
-    let isRelevant = true;
-    let filterReason = "";
+
+  // Calculate total conversation length
+  const totalLength = conversationContext.reduce((sum, msg) => sum + msg.content.length, 0) + currentMessage.length;
+  const messageCount = conversationContext.length;
+
+  // Only summarize if conversation is getting long
+  const needsSummarization = 
+    messageCount > PROJECT_CONFIG.conversation.summarizationThreshold.messageCount || 
+    totalLength > PROJECT_CONFIG.conversation.summarizationThreshold.totalLength;
+
+  if (!needsSummarization) {
+    // Just extract key info from conversation without LLM
+    const allMessages = [...conversationContext.map(m => m.content), currentMessage].join(" ");
+    const extractedInfo: SummaryContext["extractedInfo"] = {};
     
-    // If looking for quiet, filter out party/noisy hotels
-    if (intents.includes("quiet_peaceful")) {
-      if (hotelDesc.includes("party") || hotelDesc.includes("nightlife") || 
-          hotelDesc.includes("loud") || hotelDesc.includes("noisy") ||
-          hotelDesc.includes("nightclub") || hotelDesc.includes("dj")) {
-        isRelevant = false;
-        filterReason = "Hotel is party/noisy, but query wants quiet/peaceful";
-      }
+    // Simple extraction
+    if (allMessages.match(/\b(Melbourne|Sydney|Brisbane)\b/i)) {
+      const match = allMessages.match(/\b(Melbourne|Sydney|Brisbane)\b/i);
+      if (match) extractedInfo.location = match[1];
     }
     
-    // If looking for party, filter out quiet/silent hotels
-    if (intents.includes("party_nightlife")) {
-      if (hotelDesc.includes("quiet") || hotelDesc.includes("silent") || 
-          hotelDesc.includes("peaceful") || hotelDesc.includes("retreat")) {
-        isRelevant = false;
-        filterReason = "Hotel is quiet/peaceful, but query wants party/nightlife";
-      }
+    if (allMessages.match(/\$\s*(\d+)/)) {
+      const match = allMessages.match(/\$\s*(\d+)/);
+      if (match) extractedInfo.priceRange = `$${match[1]}`;
     }
     
-    // If looking for family, filter out adult-only or party hotels
-    if (intents.includes("family_friendly")) {
-      if (hotelDesc.includes("nightclub") || hotelDesc.includes("casino") ||
-          hotelDesc.includes("adults only") || hotelName.includes("party")) {
-        isRelevant = false;
-        filterReason = "Hotel not suitable for families";
-      }
+    if (allMessages.match(/\b(Luxury|Budget|Mid-tier)\b/i)) {
+      const match = allMessages.match(/\b(Luxury|Budget|Mid-tier)\b/i);
+      if (match) extractedInfo.tier = match[1];
     }
-    
-    // If looking for luxury, filter out hostels/backpacker places
-    if (intents.includes("luxury")) {
-      if (hotelDesc.includes("hostel") || hotelDesc.includes("backpacker") ||
-          hotelDesc.includes("bunk") || hotel.tier === "Budget") {
-        isRelevant = false;
-        filterReason = "Hotel is budget/hostel, but query wants luxury";
-      }
+
+    return {
+      conversationSummary: `Previous conversation: ${conversationContext.length} message(s). Key info extracted.`,
+      extractedInfo,
+      needsSummarization: false,
+    };
+  }
+
+  // Use LLM to summarize if conversation is long
+  if (!process.env.OPENAI_API_KEY) {
+    return {
+      conversationSummary: "Conversation context available but summarization requires API key.",
+      extractedInfo: {},
+      needsSummarization: true,
+    };
+  }
+
+  const openai = new OpenAI({
+    apiKey: process.env.OPENAI_API_KEY,
+  });
+
+  const conversationText = conversationContext
+    .map(msg => `${msg.role === "user" ? "User" : "Assistant"}: ${msg.content}`)
+    .join("\n");
+
+  const systemPrompt = `You are a conversation summarizer. Extract key hotel search information from the conversation history.
+
+Extract:
+- Location (Melbourne, Sydney, or Brisbane) if mentioned
+- Price range (min/max) if mentioned
+- Tier (Budget, Mid-tier, Luxury) if mentioned
+- Keywords (quiet, family, luxury, etc.)
+- Amenities (Pool, Spa, etc.)
+
+Return ONLY a JSON object with this structure:
+{
+  "summary": "Brief summary of conversation",
+  "location": "city name or null",
+  "priceRange": "price info or null",
+  "tier": "tier name or null",
+  "keywords": ["keyword1", "keyword2"],
+  "amenities": ["amenity1", "amenity2"]
+}`;
+
+  try {
+    const response = await openai.chat.completions.create({
+      model: OPENAI_MODEL,
+      temperature: PROJECT_CONFIG.openai.temperature.contextSummary,
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: `Conversation history:\n${conversationText}\n\nCurrent message: ${currentMessage}` },
+      ],
+      response_format: { type: "json_object" },
+      max_tokens: PROJECT_CONFIG.openai.maxTokens.contextSummary,
+    });
+
+    const content = response.choices[0]?.message?.content;
+    if (!content) {
+      throw new Error("Empty response from OpenAI");
     }
-    
-    // If looking for budget, filter out very expensive hotels
-    if (intents.includes("budget")) {
-      if (hotel.tier === "Luxury" || hotel.price_per_night > 300) {
-        isRelevant = false;
-        filterReason = "Hotel is luxury/expensive, but query wants budget";
-      }
-    }
-    
-    if (isRelevant) {
-      relevantHotels.push(hotel);
-    } else {
-      filteredOutHotels.push({
-        id: hotel.id,
-        name: hotel.name,
-        reason: filterReason
-      });
-    }
+
+    const parsed = JSON.parse(content);
+
+    return {
+      conversationSummary: parsed.summary || "Conversation context summarized.",
+      extractedInfo: {
+        location: parsed.location || undefined,
+        priceRange: parsed.priceRange || undefined,
+        tier: parsed.tier || undefined,
+        keywords: parsed.keywords || [],
+        amenities: parsed.amenities || [],
+      },
+      needsSummarization: true,
+    };
+  } catch (error) {
+    console.error("Error summarizing conversation:", error);
+    return {
+      conversationSummary: "Failed to summarize conversation context.",
+      extractedInfo: {},
+      needsSummarization: true,
+    };
+  }
+}
+
+/**
+ * Merge conversation context into current query
+ */
+function mergeConversationContext(
+  currentMessage: string,
+  summaryContext: SummaryContext
+): string {
+  if (!summaryContext.extractedInfo || Object.keys(summaryContext.extractedInfo).length === 0) {
+    return currentMessage;
+  }
+
+  const parts: string[] = [currentMessage];
+  
+  // Add location if missing in current message but present in context
+  if (summaryContext.extractedInfo.location && !currentMessage.match(/\b(Melbourne|Sydney|Brisbane)\b/i)) {
+    parts.push(`in ${summaryContext.extractedInfo.location}`);
   }
   
-  // If all hotels were filtered out, keep original list
-  const finalRelevantHotels = relevantHotels.length > 0 ? relevantHotels : hotels;
+  // Add price info if missing
+  if (summaryContext.extractedInfo.priceRange && !currentMessage.match(/\$\s*\d+/)) {
+    parts.push(`under ${summaryContext.extractedInfo.priceRange}`);
+  }
   
-  // Build context summary
-  const contextSummary = `Query intent: ${queryIntent}. ` +
-    `Applied filters: ${relevantFilters.join(", ")}. ` +
-    `Found ${finalRelevantHotels.length} relevant hotels` +
-    (filteredOutHotels.length > 0 ? `, filtered out ${filteredOutHotels.length} contradicting results.` : ".");
-  
-  return {
-    queryIntent,
-    relevantFilters,
-    irrelevantFiltersRemoved,
-    relevantHotels: finalRelevantHotels,
-    filteredOutHotels,
-    contextSummary
-  };
+  // Add tier if missing
+  if (summaryContext.extractedInfo.tier && !currentMessage.match(/\b(Luxury|Budget|Mid-tier)\b/i)) {
+    parts.push(`${summaryContext.extractedInfo.tier.toLowerCase()} tier`);
+  }
+
+  return parts.join(" ");
 }
 
 /**
@@ -241,17 +282,17 @@ function generateActualRpcSql(
     params.push(`p_tier: NULL`);
   }
   
-  // p_amenities: text[]
+  // p_limit: int (increased to get more results for keyword/vector ranking)
+  params.push(`p_limit: ${PROJECT_CONFIG.search.rpcLimit}`);
+  
+  // Note: Amenities are NOT filtered in SQL
+  // They are used in keyword search for ranking instead
   if (hints.amenities && hints.amenities.length > 0) {
-    params.push(`p_amenities: ARRAY[${hints.amenities.map(a => `'${a}'`).join(', ')}]`);
-  } else {
-    params.push(`p_amenities: NULL`);
+    params.push(`-- Amenities for keyword ranking: [${hints.amenities.join(', ')}]`);
   }
   
-  // p_limit: int
-  params.push(`p_limit: 15`);
-  
   const sqlBody = `
+-- STAGE 1: SQL Filter (hard constraints only)
 SELECT
   h.id,
   h.name,
@@ -264,15 +305,18 @@ SELECT
 FROM hotels h
 WHERE
   h.is_active = true
-  AND h.location = p_location
-  ${hints.minPrice !== null && hints.minPrice !== undefined ? `AND h.price_per_night >= ${hints.minPrice}` : 'AND (p_min_price IS NULL OR h.price_per_night >= p_min_price)'}
-  ${hints.maxPrice !== null && hints.maxPrice !== undefined ? `AND h.price_per_night <= ${hints.maxPrice}` : 'AND (p_max_price IS NULL OR h.price_per_night <= p_max_price)'}
-  ${hints.tier ? `AND h.tier = '${hints.tier}'` : 'AND (p_tier IS NULL OR h.tier = p_tier)'}
-  ${hints.amenities && hints.amenities.length > 0 
-    ? `AND h.amenities && ARRAY[${hints.amenities.map(a => `'${a}'`).join(', ')}]`
-    : 'AND (p_amenities IS NULL OR h.amenities IS NULL OR h.amenities && p_amenities)'}
+  AND h.location = '${hints.location}'
+  ${hints.minPrice !== null && hints.minPrice !== undefined ? `AND h.price_per_night >= ${hints.minPrice}` : '-- No min price filter'}
+  ${hints.maxPrice !== null && hints.maxPrice !== undefined ? `AND h.price_per_night <= ${hints.maxPrice}` : '-- No max price filter'}
+  ${hints.tier ? `AND h.tier = '${hints.tier}'` : '-- No tier filter'}
+  -- NOTE: Amenities are NOT filtered here (used for ranking instead)
 ORDER BY h.description_embedding <-> query_embedding
-LIMIT 15;
+LIMIT 20;
+
+-- STAGE 2: Vector + Keyword Search (done in application)
+-- Keywords: ${hints.keywords?.join(', ') || 'from query'}
+-- Amenities: ${hints.amenities?.join(', ') || 'none'}
+-- Ranking: 50% Vector Similarity + 50% BM25 Keyword Score
 `.trim();
   
   return `-- RPC Function Call: match_hotels_hybrid
@@ -283,16 +327,45 @@ ${sqlBody}`;
 }
 
 // Streaming generator for hotel search
-async function* streamHotelSearch(userMessage: string): AsyncGenerator<string> {
-  // Step 1: Parsing query
-  yield JSON.stringify({ step: "parsing", message: "🔍 Step 1: Analyzing your request..." });
+async function* streamHotelSearch(
+  userMessage: string,
+  conversationContext?: ConversationMessage[]
+): AsyncGenerator<string> {
+  // Step 0: Summarize conversation context (if needed)
+  yield JSON.stringify({ 
+    step: "context_summary", 
+    message: "📝 Step 0: Summarizing conversation context..." 
+  });
 
-  const hints: HotelSearchHints = await parseHotelQueryWithOpenAI(userMessage);
+  const summaryContext = await summarizeConversationContext(
+    conversationContext || [],
+    userMessage
+  );
+
+  yield JSON.stringify({
+    step: "context_summary_complete",
+    message: summaryContext.needsSummarization 
+      ? "📝 Conversation context summarized" 
+      : "📝 Conversation context reviewed",
+    details: {
+      summary: summaryContext.conversationSummary,
+      extractedInfo: summaryContext.extractedInfo,
+      needsSummarization: summaryContext.needsSummarization,
+    }
+  });
+
+  // Merge conversation context into current query
+  const enrichedQuery = mergeConversationContext(userMessage, summaryContext);
+
+  // Step 1: Parsing query
+  yield JSON.stringify({ step: "parsing", message: "🔍 Step 1: Extracting search parameters from your query..." });
+
+  const hints: HotelSearchHints = await parseHotelQueryWithOpenAI(enrichedQuery);
 
   // Send extracted info
   yield JSON.stringify({
     step: "parsing_complete",
-    message: "🔍 Query analyzed",
+    message: "🔍 Search parameters extracted",
     details: {
       location: hints.location || "Not specified",
       priceRange: hints.maxPrice ? `≤ $${hints.maxPrice}` : hints.minPrice ? `≥ $${hints.minPrice}` : "Any",
@@ -314,13 +387,13 @@ async function* streamHotelSearch(userMessage: string): AsyncGenerator<string> {
   }
 
   // Step 2: Generate embedding
-  yield JSON.stringify({ step: "embedding", message: "🧠 Step 2: Creating semantic embedding..." });
+  yield JSON.stringify({ step: "embedding", message: "🧠 Step 2: Generating semantic embedding for vector search..." });
 
-  const embedding = await buildEmbeddingFromQuery(userMessage);
+  const embedding = await buildEmbeddingFromQuery(enrichedQuery);
 
   yield JSON.stringify({
     step: "embedding_complete",
-    message: "🧠 Embedding created (1536 dimensions)",
+    message: "🧠 Semantic embedding generated (1536 dimensions)",
     details: {
       model: "text-embedding-3-small",
       dimensions: 1536
@@ -330,26 +403,29 @@ async function* streamHotelSearch(userMessage: string): AsyncGenerator<string> {
   // Step 3: Hybrid Search (SQL + Vector + BM25)
   yield JSON.stringify({ 
     step: "hybrid_search", 
-    message: `📍 Step 3: Hybrid Search in ${hints.location}...`
+    message: `📍 Step 3: Executing hybrid search (SQL filters + Vector similarity + Keyword matching) in ${hints.location}...`
   });
 
   // Step 3.1: Show Actual RPC SQL Code with Parameters
   const actualRpcSql = generateActualRpcSql(hints, embedding.length);
   yield JSON.stringify({
     step: "rpc_sql_code",
-    message: "📋 Step 3.1: RPC SQL Code (with actual parameters)",
+    message: "📋 Step 3.1: Executing SQL query with filters (location, price, tier)",
     details: {
       rpcFunction: "match_hotels_hybrid",
       sqlCode: actualRpcSql,
-      explanation: "This is the actual SQL code that will be executed in Supabase RPC function with your search parameters filled in.",
+      explanation: "SQL filters (location, price, tier) first, then vector similarity ranking. Amenities are used for keyword ranking, not SQL filtering.",
       parameters: {
         query_embedding: `vector(1536) - ${embedding.length} dimensions`,
         p_location: hints.location,
         p_min_price: hints.minPrice ?? null,
         p_max_price: hints.maxPrice ?? null,
         p_tier: hints.tier ?? null,
-        p_amenities: hints.amenities && hints.amenities.length > 0 ? hints.amenities : null,
-        p_limit: 15,
+        p_limit: PROJECT_CONFIG.search.rpcLimit,
+      },
+      keywordRanking: {
+        amenities: hints.amenities || [],
+        keywords: hints.keywords || [],
       }
     }
   });
@@ -360,8 +436,7 @@ async function* streamHotelSearch(userMessage: string): AsyncGenerator<string> {
     p_min_price: hints.minPrice ?? null,
     p_max_price: hints.maxPrice ?? null,
     p_tier: hints.tier ?? null,
-    p_amenities: hints.amenities && hints.amenities.length > 0 ? hints.amenities : null,
-    p_limit: 15,
+    p_limit: 20,
   });
 
   if (error) {
@@ -389,7 +464,7 @@ async function* streamHotelSearch(userMessage: string): AsyncGenerator<string> {
   // Step 3.2: Show Final Similarity Scores from RPC
   yield JSON.stringify({
     step: "rpc_similarity_scores",
-    message: `🔍 Step 3.2: Final Similarity Scores from RPC (Vector Search)`,
+    message: `🔍 Step 3.2: Calculating vector similarity scores (semantic matching)`,
     details: {
       explanation: "These similarity scores are calculated using cosine similarity between query embedding and hotel description embeddings. Range: -1 to 1 (higher is better).",
       method: "1 - (description_embedding <-> query_embedding)",
@@ -426,7 +501,7 @@ async function* streamHotelSearch(userMessage: string): AsyncGenerator<string> {
   
   yield JSON.stringify({
     step: "bm25_results",
-    message: "🔤 Step 3.3: BM25 Keyword Search Results",
+    message: "🔤 Step 3.3: Calculating BM25 keyword matching scores",
     details: {
       explanation: "BM25 scoring calculates relevance based on keyword frequency in hotel name, description, and amenities. Higher score = more keyword matches.",
       method: "BM25-style term frequency matching",
@@ -447,6 +522,8 @@ async function* streamHotelSearch(userMessage: string): AsyncGenerator<string> {
   });
 
   // Step 3.4: Combined Ranking (50% Vector + 50% BM25)
+  // Sort STRICTLY by combined score (highest first)
+  // Price is only used as tie-breaker when scores are EXACTLY equal
   const combinedResults = hotelsWithKeywordScore.map(hotel => {
     const normalizedVectorScore = (hotel.similarity + 1) / 2; // Convert -1..1 to 0..1
     const keywordScore = hotel.keywordScore || 0;
@@ -457,11 +534,22 @@ async function* streamHotelSearch(userMessage: string): AsyncGenerator<string> {
       normalizedVectorScore,
       combinedScore,
     };
-  }).sort((a, b) => (b.combinedScore || 0) - (a.combinedScore || 0));
+  }).sort((a, b) => {
+    const scoreA = a.combinedScore || 0;
+    const scoreB = b.combinedScore || 0;
+    
+    // PRIMARY: Sort by combined score (highest first) - ALWAYS
+    if (scoreA !== scoreB) {
+      return scoreB - scoreA; // Higher score first
+    }
+    
+    // SECONDARY: Only if scores are EXACTLY equal, prefer lower price
+    return a.price_per_night - b.price_per_night;
+  });
 
   yield JSON.stringify({
     step: "combined_ranking",
-    message: "⚖️ Step 3.4: Combined Ranking (50% Vector + 50% BM25)",
+    message: "⚖️ Step 3.4: Computing final match scores (50% Vector + 50% BM25) and sorting by highest score",
     details: {
       explanation: "Final match score combines vector similarity (semantic meaning) and keyword matching (exact terms). This gives balanced results.",
       formula: "combinedScore = normalizedVectorScore × 0.5 + keywordScore × 0.5",
@@ -490,27 +578,73 @@ async function* streamHotelSearch(userMessage: string): AsyncGenerator<string> {
     step: "validating", 
     message: "✅ Step 4: Validating data integrity & quality checks...",
     details: {
-      explanation: "This step ensures all hotel data is valid and meets quality standards before showing results to users.",
-      checks: [
-        "Price validation: Must be positive and non-zero",
-        "Tier-Price consistency: Hotel tier must match its price range",
-        "Location validation: Must be a valid city (Melbourne, Sydney, Brisbane)",
-        "Similarity score validation: Must be in valid range (-1 to 1)",
-        "Name validation: Hotel name must exist and not be empty"
-      ]
+      explanation: "Validating each hotel against quality criteria to ensure consistent, accurate results.",
+      validationCriteria: {
+        priceCheck: "Price must be positive and non-zero",
+        tierPriceConsistency: "Hotel tier must match price range (Budget: <$150, Mid-tier: $150-$350, Luxury: >$350)",
+        locationCheck: "Must be a valid city (Melbourne, Sydney, Brisbane)",
+        similarityCheck: "Vector similarity score must be in valid range (-1 to 1)",
+        nameCheck: "Hotel name must exist and not be empty",
+        amenitiesCheck: "Amenities array must be valid (can be empty)"
+      }
     }
   });
 
   const validatedHotels: HotelSearchResult[] = [];
-  const validationDetails: Array<{ hotelId: number; hotelName: string; valid: boolean; reason?: string }> = [];
+  const validationDetails: Array<{ 
+    hotelId: number; 
+    hotelName: string; 
+    price: number;
+    tier: string | null;
+    valid: boolean; 
+    reason?: string;
+    checks: { [key: string]: boolean | string };
+  }> = [];
   
   for (const hotel of combinedResults) {
     const validation = validateHotelResult(hotel);
+    
+    // Detailed validation checks
+    const checks: { [key: string]: boolean | string } = {
+      priceValid: hotel.price_per_night > 0 ? "✅ Pass" : "❌ Invalid price",
+      locationValid: ["Melbourne", "Sydney", "Brisbane"].includes(hotel.location) ? "✅ Pass" : "❌ Invalid location",
+      nameValid: hotel.name && hotel.name.trim().length > 0 ? "✅ Pass" : "❌ Missing name",
+      similarityValid: hotel.similarity >= -1 && hotel.similarity <= 1 ? "✅ Pass" : "❌ Invalid similarity",
+    };
+    
+    // Tier-price consistency check
+    if (hotel.tier === "Budget" && hotel.price_per_night <= 150) {
+      checks.tierPriceConsistency = "✅ Pass";
+    } else if (hotel.tier === "Mid-tier" && hotel.price_per_night > 150 && hotel.price_per_night <= 350) {
+      checks.tierPriceConsistency = "✅ Pass";
+    } else if (hotel.tier === "Luxury" && hotel.price_per_night > 350) {
+      checks.tierPriceConsistency = "✅ Pass";
+    } else if (!hotel.tier) {
+      checks.tierPriceConsistency = "⚠️ No tier";
+    } else {
+      checks.tierPriceConsistency = `⚠️ Mismatch: ${hotel.tier} at $${hotel.price_per_night}`;
+    }
+    
+    // Amenities matching check (for user reference)
+    if (hints.amenities && hints.amenities.length > 0 && hotel.amenities) {
+      const matchedAmenities = hints.amenities.filter(a => 
+        hotel.amenities?.some(ha => ha.toLowerCase().includes(a.toLowerCase()))
+      );
+      checks.amenitiesMatch = matchedAmenities.length > 0 
+        ? `✅ ${matchedAmenities.length}/${hints.amenities.length} matched` 
+        : "⚠️ No amenities matched";
+    } else {
+      checks.amenitiesMatch = "N/A";
+    }
+    
     validationDetails.push({
       hotelId: hotel.id,
       hotelName: hotel.name,
+      price: hotel.price_per_night,
+      tier: hotel.tier,
       valid: validation.valid,
       reason: validation.reason,
+      checks,
     });
     
     if (validation.valid) {
@@ -524,41 +658,90 @@ async function* streamHotelSearch(userMessage: string): AsyncGenerator<string> {
     step: "validation_complete",
     message: `✅ Validated: ${validatedHotels.length}/${combinedResults.length} hotels passed quality checks`,
     details: {
-      explanation: "Hotels that fail validation are filtered out to ensure only high-quality, consistent results are shown.",
-      passed: validatedHotels.length,
-      failed: combinedResults.length - validatedHotels.length,
-      validationResults: validationDetails.filter(v => !v.valid).map(v => ({
-        hotelId: v.hotelId,
-        hotelName: v.hotelName,
+      explanation: "Hotels that fail validation are filtered out. Details show each hotel's validation status.",
+      summary: {
+        totalChecked: combinedResults.length,
+        passed: validatedHotels.length,
+        failed: combinedResults.length - validatedHotels.length,
+      },
+      passedHotels: validationDetails.filter(v => v.valid).slice(0, 10).map(v => ({
+        id: v.hotelId,
+        name: v.hotelName,
+        price: `$${v.price}/night`,
+        tier: v.tier || "N/A",
+        checks: v.checks,
+      })),
+      failedHotels: validationDetails.filter(v => !v.valid).map(v => ({
+        id: v.hotelId,
+        name: v.hotelName,
         reason: v.reason,
+        checks: v.checks,
       })),
     }
   });
 
-  // Limit results to 3-5 hotels
-  const minResults = 3;
-  const maxResults = 5;
-  const candidateHotels = validatedHotels.slice(0, Math.min(maxResults, Math.max(minResults, validatedHotels.length)));
-
-  // Step 5: Summary Context - Filter irrelevant info based on query
-  yield JSON.stringify({ step: "summary_context", message: "📝 Step 5: Summarizing context & filtering irrelevant info..." });
-
-  // Build summary context - filter only relevant information for the query
-  const summaryContext = buildSummaryContext(userMessage, hints, candidateHotels);
-  
-  yield JSON.stringify({
-    step: "summary_context_complete",
-    message: "📝 Context summarized",
-    details: summaryContext
+  // Step 5: Final Ranking (LLM re-ranking only if needed, otherwise keep sorted by match score)
+  yield JSON.stringify({ 
+    step: "llm_reranking", 
+    message: "📊 Step 5: Applying final ranking (highest match score first)...",
+    details: {
+      explanation: "Hotels are sorted strictly by combined match score (highest first). Price is only used as tie-breaker when scores are exactly equal.",
+      sortByPrice: hints.sortByPrice,
+      userIntent: hints.sortByPrice === "asc" ? "Cheapest first" : hints.sortByPrice === "desc" ? "Most expensive first" : "Highest match score first"
+    }
   });
 
-  // Final hotels after context filtering
-  const finalHotels = summaryContext.relevantHotels;
+  // LLM Re-ranking (only for special cases, otherwise keeps sorted by match score)
+  const rerankedHotels = await llmReRankHotels(validatedHotels, userMessage, hints);
+  
+  yield JSON.stringify({
+    step: "llm_reranking_complete",
+    message: `✅ Final ranking complete: ${rerankedHotels.length} hotels sorted by highest match score`,
+    details: {
+      explanation: hints.sortByPrice 
+        ? `Hotels sorted by price (${hints.sortByPrice === "asc" ? "lowest to highest" : "highest to lowest"})` 
+        : "Hotels sorted by combined match score (highest first)",
+      topResults: rerankedHotels.slice(0, 5).map((h, i) => ({
+        rank: i + 1,
+        name: h.name,
+        price: h.price_per_night,
+        matchScore: Math.round((h.combinedScore || 0) * 100) + "%"
+      }))
+    }
+  });
 
-  // Step 6: Send results
+  // Limit results to configured range
+  const finalHotels = rerankedHotels.slice(0, Math.min(
+    PROJECT_CONFIG.search.maxResults, 
+    Math.max(PROJECT_CONFIG.search.minResults, rerankedHotels.length)
+  ));
+
+  // Step 6: Generate natural language response (streaming)
+  yield JSON.stringify({ 
+    step: "generating_response", 
+    message: `💬 Step 6: Generating personalized recommendations...` 
+  });
+
+  // Stream natural language response word by word
+  let fullResponse = "";
+  for await (const chunk of generateNaturalResponseStreaming(finalHotels, hints)) {
+    fullResponse += chunk;
+    yield JSON.stringify({
+      type: "response_chunk",
+      chunk: chunk,
+    });
+  }
+
+  // Mark response complete
+  yield JSON.stringify({
+    type: "response_complete",
+    message: fullResponse,
+  });
+
+  // Step 7: Send hotel results
   yield JSON.stringify({ 
     step: "found", 
-    message: `✨ Step 6: Found ${finalHotels.length} best matching hotel${finalHotels.length > 1 ? 's' : ''}!` 
+    message: `✨ Step 7: Showing top ${finalHotels.length} hotel${finalHotels.length > 1 ? 's' : ''} (sorted by highest match score)` 
   });
 
   // Send hotels one by one for streaming effect
@@ -573,15 +756,12 @@ async function* streamHotelSearch(userMessage: string): AsyncGenerator<string> {
     });
   }
 
-  // Final summary
-  const naturalResponse = generateNaturalResponse(finalHotels, hints);
-  
+  // Final results summary
   yield JSON.stringify({
     type: "results",
-    message: naturalResponse,
+    message: fullResponse,
     hints,
     hotels: finalHotels,
-    summaryContext,
     matchReasons: finalHotels.map(h => ({
       hotelId: h.id,
       matchScore: Math.round((h.combinedScore || 0) * 100),
@@ -636,6 +816,7 @@ export async function POST(req: NextRequest) {
     const body = (await req.json()) as RequestBody;
     const userMessage = (body.message || "").trim();
     const useStream = body.stream !== false; // Default to streaming
+    const conversationContext = body.conversationContext || [];
 
     if (!userMessage) {
       const response = {
@@ -655,11 +836,15 @@ export async function POST(req: NextRequest) {
 
     // Use streaming response
     if (useStream) {
-      return createStreamResponse(streamHotelSearch(userMessage));
+      return createStreamResponse(streamHotelSearch(userMessage, conversationContext));
     }
 
     // Non-streaming fallback
-    const hints: HotelSearchHints = await parseHotelQueryWithOpenAI(userMessage);
+    // Summarize conversation context first
+    const summaryContext = await summarizeConversationContext(conversationContext, userMessage);
+    const enrichedQuery = mergeConversationContext(userMessage, summaryContext);
+    
+    const hints: HotelSearchHints = await parseHotelQueryWithOpenAI(enrichedQuery);
 
     if (!hints.location) {
       return Response.json({
@@ -670,7 +855,7 @@ export async function POST(req: NextRequest) {
       });
     }
 
-    const embedding = await buildEmbeddingFromQuery(userMessage);
+    const embedding = await buildEmbeddingFromQuery(enrichedQuery);
 
     const { data, error } = await supabaseRpcWithRetry("match_hotels_hybrid", {
       query_embedding: embedding,
@@ -678,8 +863,7 @@ export async function POST(req: NextRequest) {
       p_min_price: hints.minPrice ?? null,
       p_max_price: hints.maxPrice ?? null,
       p_tier: hints.tier ?? null,
-      p_amenities: hints.amenities && hints.amenities.length > 0 ? hints.amenities : null,
-      p_limit: 15,
+      p_limit: 20,
     });
 
     if (error) {
@@ -708,10 +892,23 @@ export async function POST(req: NextRequest) {
     }));
 
     // Calculate combined scores and sort
+    // When similarity scores are similar, prioritize lower price
     const rankedHotels = hotelsWithScores.map(hotel => ({
       ...hotel,
       combinedScore: calculateCombinedScore(hotel.similarity, hotel.keywordScore, 0.5)
-    })).sort((a, b) => (b.combinedScore || 0) - (a.combinedScore || 0));
+    })).sort((a, b) => {
+      const scoreA = a.combinedScore || 0;
+      const scoreB = b.combinedScore || 0;
+      const scoreDiff = Math.abs(scoreA - scoreB);
+      
+      // If scores are very similar (difference < 0.05 or 5%), prioritize lower price
+      if (scoreDiff < 0.05) {
+        return a.price_per_night - b.price_per_night; // Lower price first
+      }
+      
+      // Otherwise, sort by combined score (higher first)
+      return scoreB - scoreA;
+    });
 
     // Validate hotels
     const validatedHotels: HotelSearchResult[] = [];
@@ -723,13 +920,14 @@ export async function POST(req: NextRequest) {
     }
 
     // Limit results
-    const minResults = 3;
-    const maxResults = 5;
-    const finalHotels = validatedHotels.slice(0, Math.min(maxResults, Math.max(minResults, validatedHotels.length)));
+    const finalHotels = validatedHotels.slice(0, Math.min(
+      PROJECT_CONFIG.search.maxResults, 
+      Math.max(PROJECT_CONFIG.search.minResults, validatedHotels.length)
+    ));
 
     return Response.json({
       type: "results",
-      message: generateNaturalResponse(finalHotels, hints),
+      message: await generateNaturalResponse(finalHotels, hints),
       hints,
       hotels: finalHotels,
       matchReasons: finalHotels.map(h => ({
